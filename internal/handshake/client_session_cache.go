@@ -3,26 +3,41 @@ package handshake
 import (
 	"crypto/tls"
 	"encoding/asn1"
+	"encoding/binary"
+	"fmt"
+	"time"
 	"unsafe"
 
 	"github.com/marten-seemann/qtls"
+
+	"github.com/lucas-clemente/quic-go/internal/congestion"
 )
+
+const clientSessionStateRevision = 1
 
 type nonceField struct {
 	Nonce   []byte
 	AppData []byte
+	RTT     int64 // in ns
 }
 
 type clientSessionCache struct {
 	tls.ClientSessionCache
+	rttStats *congestion.RTTStats
 
 	getAppData func() []byte
 	setAppData func([]byte)
 }
 
-func newClientSessionCache(cache tls.ClientSessionCache, get func() []byte, set func([]byte)) *clientSessionCache {
+func newClientSessionCache(
+	cache tls.ClientSessionCache,
+	rttStats *congestion.RTTStats,
+	get func() []byte,
+	set func([]byte),
+) *clientSessionCache {
 	return &clientSessionCache{
 		ClientSessionCache: cache,
+		rttStats:           rttStats,
 		getAppData:         get,
 		setAppData:         set,
 	}
@@ -43,12 +58,22 @@ func (c *clientSessionCache) Get(sessionKey string) (*qtls.ClientSessionState, b
 	var session clientSessionState
 	sessBytes := (*[unsafe.Sizeof(session)]byte)(unsafe.Pointer(&session))[:]
 	copy(sessBytes, tlsSessBytes)
+	if len(session.nonce) < 4 {
+		fmt.Println(1)
+		return nil, false
+	}
+	if binary.BigEndian.Uint32(session.nonce[:4]) != clientSessionStateRevision {
+		fmt.Println(2)
+		return nil, false
+	}
 	var nf nonceField
-	if _, err := asn1.Unmarshal(session.nonce, &nf); err != nil {
+	if rest, err := asn1.Unmarshal(session.nonce[4:], &nf); err != nil || len(rest) != 0 {
+		fmt.Println(3)
 		return nil, false
 	}
 	c.setAppData(nf.AppData)
 	session.nonce = nf.Nonce
+	c.rttStats.SetInitialRTT(time.Duration(nf.RTT) * time.Nanosecond)
 	var qtlsSession qtls.ClientSessionState
 	qtlsSessBytes := (*[unsafe.Sizeof(qtlsSession)]byte)(unsafe.Pointer(&qtlsSession))[:]
 	copy(qtlsSessBytes, sessBytes)
@@ -68,10 +93,14 @@ func (c *clientSessionCache) Put(sessionKey string, cs *qtls.ClientSessionState)
 	var session clientSessionState
 	sessBytes := (*[unsafe.Sizeof(session)]byte)(unsafe.Pointer(&session))[:]
 	copy(sessBytes, qtlsSessBytes)
-	nonce, err := asn1.Marshal(nonceField{
+	data, err := asn1.Marshal(nonceField{
 		Nonce:   session.nonce,
 		AppData: c.getAppData(),
+		RTT:     c.rttStats.SmoothedRTT().Nanoseconds(),
 	})
+	nonce := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(nonce[:4], clientSessionStateRevision)
+	copy(nonce[4:], data)
 	if err != nil { // marshaling
 		panic(err)
 	}
